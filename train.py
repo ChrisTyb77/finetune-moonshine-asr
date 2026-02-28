@@ -578,6 +578,11 @@ def main():
     # ============================================
     generation_config = curriculum.get_generation_config(phase)
 
+    # Allow YAML generation.max_new_tokens to override the default computed cap (50 tokens).
+    # Important for non-English languages where tokenizer uses more tokens per word.
+    if config.get('generation', {}).get('max_new_tokens'):
+        generation_config['max_new_tokens'] = config['generation']['max_new_tokens']
+
     trainer = MoonshineSeq2SeqTrainer(
         model=model,
         args=training_args,

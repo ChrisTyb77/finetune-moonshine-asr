@@ -1,0 +1,81 @@
+# Configuration for fine-tuning Moonshine Tiny on MLS Polish
+# Target hardware: Google Colab T4 (16GB VRAM)
+# Dataset: facebook/multilingual_librispeech (polish) — 25,043 train samples
+# Steps/epoch: 25,043 / 64 (effective batch) ≈ 391
+
+model:
+  name: "UsefulSensors/moonshine-tiny"
+  freeze_encoder: false
+
+dataset:
+  type: "mls"
+  language: "polish"
+
+audio:
+  sampling_rate: 16000
+  max_duration: 20.0
+  min_duration: 4.0   # Moonshine paper: clips <4s cause repetition loops (>100% WER)
+
+preprocessing:
+  num_proc: 2          # Colab has limited CPU cores
+  normalize_audio: true
+  target_rms: 0.075
+
+curriculum:
+  enabled: false       # Dataset is small — curriculum adds little value here
+
+training:
+  output_dir: "./results-moonshine-pl-tiny"
+
+  # T4 (16GB VRAM) settings — tiny model fits larger batches
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 32
+  gradient_accumulation_steps: 4   # Effective batch size = 16 * 4 = 64
+  gradient_checkpointing: true
+  fp16: true
+  fp16_full_eval: true
+  group_by_length: true
+  length_column_name: "input_length"
+  max_grad_norm: 1.0
+  dataloader_num_workers: 2
+
+  # 3200 steps ≈ 8.2 epochs (proportional to French config: 8000 steps / 60k samples)
+  max_steps: 3200
+
+  # Optimizer (Moonshine paper: schedule-free AdamW)
+  optim: "schedule_free_adamw"
+  learning_rate: 3.0e-4
+  lr_scheduler_type: "constant_with_warmup"
+  warmup_steps: 200          # 6.25% of 3200 steps — safer for new language
+
+  # Evaluation — ~every epoch (391 steps ≈ 400)
+  eval_strategy: "steps"
+  eval_steps: 400
+  save_steps: 400
+  logging_steps: 25
+  predict_with_generate: true
+
+  # Model selection
+  load_best_model_at_end: true
+  metric_for_best_model: "wer"
+  greater_is_better: false
+  save_total_limit: 3
+
+  # Logging
+  report_to: ["tensorboard"]
+  logging_dir: "./logs/moonshine-pl-tiny"
+
+  # Hub (optional — fill in to auto-push to HuggingFace)
+  push_to_hub: false
+  hub_model_id: null
+  hub_strategy: "every_save"
+  hub_token: null
+
+generation:
+  max_new_tokens: 128        # Higher than English due to byte-fallback tokenization of Polish chars
+  length_penalty: 1.2
+  do_sample: false
+  early_stopping: true
+  repetition_penalty: 1.3
+  num_beams: 5
+  no_repeat_ngram_size: 3    # Polish has many inflected forms; 3-grams reduce repetitions
