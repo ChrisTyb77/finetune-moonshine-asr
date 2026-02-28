@@ -41,6 +41,23 @@ from moonshine_ft.data_loader import MoonshineDataLoader
 from moonshine_ft.curriculum import CurriculumScheduler
 
 
+def _sync_schedulefree_dtype(trainer):
+    """Align schedule_free optimizer z-buffer dtype with current model param dtype.
+
+    schedule_free_adamw maintains the z-buffer in FP32 for numerical precision,
+    while model params are in FP16 during training. optimizer.eval() calls
+    p.lerp_(end=z, ...) which requires both tensors to share the same dtype.
+    This function casts z to match p before each evaluate() call.
+    """
+    if trainer.optimizer is None:
+        return
+    for group in trainer.optimizer.param_groups:
+        for p in group['params']:
+            state = trainer.optimizer.state.get(p, {})
+            if 'z' in state and state['z'].dtype != p.data.dtype:
+                state['z'] = state['z'].to(dtype=p.data.dtype)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Fine-tune Moonshine ASR with Curriculum Learning',
@@ -198,31 +215,33 @@ class MoonshineSeq2SeqTrainer(Seq2SeqTrainer):
         # If only computing loss, don't generate
         if prediction_loss_only:
             with torch.no_grad():
-                outputs = model(**inputs)
-                loss = outputs.loss if hasattr(outputs, "loss") else None
+                with torch.cuda.amp.autocast(enabled=self.args.fp16 or self.args.bf16):
+                    outputs = model(**inputs)
+                    loss = outputs.loss if hasattr(outputs, "loss") else None
             return (loss, None, None)
 
         # Generate predictions
         with torch.no_grad():
-            # Calculate loss first (if labels available)
-            if has_labels:
-                outputs = model(**inputs)
-                loss = outputs.loss
-            else:
-                loss = None
+            with torch.cuda.amp.autocast(enabled=self.args.fp16 or self.args.bf16):
+                # Calculate loss first (if labels available)
+                if has_labels:
+                    outputs = model(**inputs)
+                    loss = outputs.loss
+                else:
+                    loss = None
 
-            # Generate transcriptions with phase-specific parameters
-            generation_kwargs = {
-                "max_new_tokens": max_new_tokens,
-                **self.generation_config
-            }
+                # Generate transcriptions with phase-specific parameters
+                generation_kwargs = {
+                    "max_new_tokens": max_new_tokens,
+                    **self.generation_config
+                }
 
-            # Moonshine generate expects input_values (not input_features)
-            generated_tokens = model.generate(
-                input_values=inputs["input_values"],
-                attention_mask=inputs.get("attention_mask", None),
-                **generation_kwargs
-            )
+                # Moonshine generate expects input_values (not input_features)
+                generated_tokens = model.generate(
+                    input_values=inputs["input_values"],
+                    attention_mask=inputs.get("attention_mask", None),
+                    **generation_kwargs
+                )
 
         if labels is not None:
             labels = labels.detach()
@@ -524,11 +543,13 @@ def main():
     eval_steps = train_config['eval_steps']
     save_steps = train_config['save_steps']
     logging_steps = train_config['logging_steps']
+    eval_on_start = False
     if args.test_mode:
         max_steps = 20  # ~3 minutes on T4 — just enough to verify the full pipeline
         eval_steps = 10
         save_steps = 10
         logging_steps = 5
+        eval_on_start = True  # Baseline WER before any weight updates
     learning_rate = phase.learning_rate
 
     training_args = Seq2SeqTrainingArguments(
@@ -560,6 +581,7 @@ def main():
         # Evaluation
         eval_strategy=train_config['eval_strategy'],
         eval_steps=eval_steps,
+        eval_on_start=eval_on_start,
         save_steps=save_steps,
         logging_steps=logging_steps,
         predict_with_generate=train_config['predict_with_generate'],
@@ -620,17 +642,6 @@ def main():
         print(f"Target WER: <{phase.target_wer}%")
     print("="*80 + "\n")
 
-    # Baseline evaluation (pretrained model, before any weight updates)
-    print("\nRunning baseline evaluation (pretrained model)...")
-    baseline_wer = None
-    try:
-        baseline_results = trainer.evaluate()
-        baseline_wer = baseline_results.get('eval_wer', None)
-        if baseline_wer is not None:
-            print(f"[OK] Baseline WER (before fine-tuning): {baseline_wer:.2f}%")
-    except Exception as e:
-        print(f"[WARNING] Baseline evaluation failed: {e}")
-
     trainer.train()
 
     # ============================================
@@ -645,20 +656,26 @@ def main():
     # ============================================
     print("\nRunning final evaluation...")
 
-    # Convert model to FP32 before final evaluation to avoid dtype mismatch
-    if training_args.fp16:
+    # For non-schedule_free optimizers, convert to FP32 before eval to avoid dtype mismatch.
+    # For schedule_free, we instead sync the z-buffer dtype — converting the model to FP32
+    # breaks optimizer.eval() because z was initialized from FP16 params and stays FP32,
+    # while p ends up FP32 too but lerp_ still fails due to internal aliasing.
+    uses_schedule_free = 'schedule_free' in train_config.get('optim', '')
+    if training_args.fp16 and not uses_schedule_free:
         print("Converting model to FP32 for final evaluation...")
         model = model.float()
         trainer.model = model
 
     try:
+        _sync_schedulefree_dtype(trainer)
         results = trainer.evaluate()
     except RuntimeError as e:
-        if "should be the same" in str(e):
-            print(f"\n⚠️  Final evaluation skipped due to dtype mismatch (this is a known issue with FP16 training)")
+        if "should be the same" in str(e) or "expected dtype" in str(e):
+            print(f"\n[WARNING] Final evaluation skipped due to dtype mismatch.")
             print(f"Your model was saved successfully to: {training_args.output_dir}/final")
-            print(f"\nYou can evaluate it separately with:")
-            print(f"  python scripts/evaluate.py --model {training_args.output_dir}/final --dataset {config['dataset']['name']} --split test")
+            print(f"\nEvaluate separately with:")
+            dataset_ref = config['dataset'].get('name') or config['dataset'].get('path', 'facebook/multilingual_librispeech')
+            print(f"  python scripts/evaluate.py --model {training_args.output_dir}/final --dataset {dataset_ref} --split test")
             results = None
         else:
             raise
@@ -673,13 +690,6 @@ def main():
     if results is not None:
         for key, value in results.items():
             print(f"  {key}: {value:.4f}" if isinstance(value, float) else f"  {key}: {value}")
-
-        final_wer = results.get('eval_wer', None)
-        if baseline_wer is not None and final_wer is not None:
-            improvement = baseline_wer - final_wer
-            print(f"\n  Baseline WER:    {baseline_wer:.2f}%")
-            print(f"  Fine-tuned WER:  {final_wer:.2f}%")
-            print(f"  Improvement:     {improvement:+.2f}pp")
 
         if config['curriculum']['enabled']:
             actual_wer = results.get('eval_wer', 100)
