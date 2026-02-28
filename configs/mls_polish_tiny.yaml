@@ -14,7 +14,7 @@ dataset:
 audio:
   sampling_rate: 16000
   max_duration: 20.0
-  min_duration: 4.0   # Moonshine paper: clips <4s cause repetition loops (>100% WER)
+  min_duration: 1.0   # Hard limit from Moonshine paper (<1s causes repetitions); MLS clips are naturally 4-20s
 
 preprocessing:
   num_proc: 2          # Colab has limited CPU cores
