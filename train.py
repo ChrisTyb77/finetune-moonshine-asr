@@ -521,8 +521,14 @@ def main():
 
     # Override with phase-specific and CLI args
     max_steps = args.max_steps or phase.max_steps
+    eval_steps = train_config['eval_steps']
+    save_steps = train_config['save_steps']
+    logging_steps = train_config['logging_steps']
     if args.test_mode:
-        max_steps = 20  # Reduce steps for test mode
+        max_steps = 20  # ~3 minutes on T4 — just enough to verify the full pipeline
+        eval_steps = 10
+        save_steps = 10
+        logging_steps = 5
     learning_rate = phase.learning_rate
 
     training_args = Seq2SeqTrainingArguments(
@@ -553,9 +559,9 @@ def main():
 
         # Evaluation
         eval_strategy=train_config['eval_strategy'],
-        eval_steps=train_config['eval_steps'],
-        save_steps=train_config['save_steps'],
-        logging_steps=train_config['logging_steps'],
+        eval_steps=eval_steps,
+        save_steps=save_steps,
+        logging_steps=logging_steps,
         predict_with_generate=train_config['predict_with_generate'],
 
         # Model selection
@@ -614,6 +620,17 @@ def main():
         print(f"Target WER: <{phase.target_wer}%")
     print("="*80 + "\n")
 
+    # Baseline evaluation (pretrained model, before any weight updates)
+    print("\nRunning baseline evaluation (pretrained model)...")
+    baseline_wer = None
+    try:
+        baseline_results = trainer.evaluate()
+        baseline_wer = baseline_results.get('eval_wer', None)
+        if baseline_wer is not None:
+            print(f"[OK] Baseline WER (before fine-tuning): {baseline_wer:.2f}%")
+    except Exception as e:
+        print(f"[WARNING] Baseline evaluation failed: {e}")
+
     trainer.train()
 
     # ============================================
@@ -656,6 +673,13 @@ def main():
     if results is not None:
         for key, value in results.items():
             print(f"  {key}: {value:.4f}" if isinstance(value, float) else f"  {key}: {value}")
+
+        final_wer = results.get('eval_wer', None)
+        if baseline_wer is not None and final_wer is not None:
+            improvement = baseline_wer - final_wer
+            print(f"\n  Baseline WER:    {baseline_wer:.2f}%")
+            print(f"  Fine-tuned WER:  {final_wer:.2f}%")
+            print(f"  Improvement:     {improvement:+.2f}pp")
 
         if config['curriculum']['enabled']:
             actual_wer = results.get('eval_wer', 100)
