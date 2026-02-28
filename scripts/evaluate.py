@@ -329,6 +329,12 @@ Examples:
         help='Dataset split to evaluate (default: test)'
     )
     parser.add_argument(
+        '--language',
+        type=str,
+        default=None,
+        help='Dataset config/language name for HuggingFace datasets (e.g. "polish" for MLS)'
+    )
+    parser.add_argument(
         '--audio-column',
         type=str,
         default='audio',
@@ -408,7 +414,7 @@ Examples:
                 dataset = dataset_dict
         else:
             # Try HuggingFace Hub
-            dataset = load_dataset(args.dataset, split=args.split)
+            dataset = load_dataset(args.dataset, args.language, split=args.split)
 
         print(f"Loaded {len(dataset)} samples from split '{args.split}'")
 
