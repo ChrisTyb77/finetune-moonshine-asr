@@ -521,6 +521,8 @@ def main():
 
     # Override with phase-specific and CLI args
     max_steps = args.max_steps or phase.max_steps
+    if args.test_mode:
+        max_steps = 20  # Reduce steps for test mode
     learning_rate = phase.learning_rate
 
     training_args = Seq2SeqTrainingArguments(
