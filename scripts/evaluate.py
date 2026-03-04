@@ -27,7 +27,7 @@ from typing import Dict, List, Optional
 
 import torch
 import numpy as np
-from datasets import load_from_disk, load_dataset
+from datasets import load_from_disk, load_dataset, Audio
 from transformers import (
     MoonshineForConditionalGeneration,
     AutoProcessor
@@ -215,6 +215,9 @@ class MoonshineEvaluator:
         """
         if max_samples:
             dataset = dataset.select(range(min(max_samples, len(dataset))))
+
+        # Resample audio to 16kHz (required by Moonshine feature extractor)
+        dataset = dataset.cast_column(audio_column, Audio(sampling_rate=16000))
 
         print(f"\nEvaluating on {len(dataset)} samples...")
 
@@ -417,6 +420,14 @@ Examples:
             dataset = load_dataset(args.dataset, args.language, split=args.split)
 
         print(f"Loaded {len(dataset)} samples from split '{args.split}'")
+
+        # Auto-detect text column if default not found in dataset
+        if args.text_column not in dataset.column_names:
+            for candidate in ['transcript', 'text', 'transcription', 'sentence']:
+                if candidate in dataset.column_names:
+                    print(f"Column '{args.text_column}' not found, using '{candidate}'")
+                    args.text_column = candidate
+                    break
 
     except Exception as e:
         print(f"Error loading dataset: {e}")
